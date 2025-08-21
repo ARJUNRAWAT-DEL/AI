@@ -1,33 +1,26 @@
 from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect
 import os
-import json
-from .db import init_db
 
-
-
-
-from . import db, crud, ai_utils
+from . import db, crud, ai_utils, schemas
 
 app = FastAPI()
 
-# ------------------ CORS ------------------
+# ------------- CORS -------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # narrow this in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------ Config ------------------
+# ------------- Config -------------
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Dependency to get DB session
 def get_db():
     db_session = db.SessionLocal()
     try:
@@ -35,44 +28,36 @@ def get_db():
     finally:
         db_session.close()
 
-# ------------------ Startup check ------------------
+# ------------- Health on startup -------------
 @app.on_event("startup")
 def startup_event():
     try:
         insp = inspect(db.engine)
-        tables = insp.get_table_names()
-        if tables:
-            print(f"✅ Connected to DB. Found tables: {tables}")
-        else:
-            print("⚠️ Connected to DB but no tables found!")
+        print(f"✅ Connected to DB. Found tables: {insp.get_table_names()}")
     except Exception as e:
-        print(f"❌ Failed to connect to DB: {e}")
+        print(f"❌ DB connection failed: {e}")
 
-
-# ------------------ Routes ------------------
-@app.post("/upload")
+# ------------- Upload -------------
+@app.post("/upload", response_model=dict)
 async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
     file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-
-    # Save raw file
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
-    # Extract text
     content = ai_utils.extract_text_from_file(file_path)
     if not content.strip():
         raise HTTPException(status_code=400, detail="❌ Could not extract text from file.")
 
-    # Summarize preview (first 1000 words only)
-    preview_text = " ".join(content.split()[:1000])
-    summary = ai_utils.generate_summary(preview_text)
+    # optional preview summary
+    preview = " ".join(content.split()[:1500])
+    summary = ai_utils.generate_summary(preview)
 
-    # Generate embeddings per chunk
-    chunk_data = ai_utils.generate_embeddings_in_chunks(content)
+    # chunk + embed (normalized)
+    chunk_data = ai_utils.generate_embeddings_in_chunks(content, chunk_size=800, overlap=120)
     if not chunk_data:
         raise HTTPException(status_code=500, detail="❌ Embedding generation failed.")
 
-    # Save document + its chunks in DB
+    # persist (expects your CRUD to insert Document and related Chunks)
     doc = crud.create_document(
         db,
         title=file.filename,
@@ -81,51 +66,29 @@ async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db
         chunks=chunk_data
     )
 
-    return {
-        "id": doc.id,
-        "title": doc.title,
-        "summary": doc.summary,
-        "message": "✅ File uploaded and processed successfully"
-    }
+    return {"id": doc.id, "title": doc.title, "message": "✅ File uploaded & indexed."}
 
-
-@app.get("/search")
+# ------------- Search -------------
+@app.get("/search", response_model=schemas.AnswerOut)
 def search_documents(q: str = Query(..., description="Search query"), db: Session = Depends(get_db)):
     if not q.strip():
         raise HTTPException(status_code=400, detail="❌ Query cannot be empty.")
 
-    query_embedding = ai_utils.generate_embedding(q)
+    query_emb = ai_utils.generate_embedding(q)
 
-    # 🔹 Step 1: Retrieve top-k chunks by embedding similarity
-    results = crud.search_chunks(db, query_embedding, top_k=10)
+    # Step 1: vector search (top 10)
+    # expected shape: [{"text": ..., "doc_id": ..., "doc_title": ..., "score": ...}, ...]
+    results = crud.search_chunks(db, query_emb, top_k=10)
     if not results:
-        return {"query": q, "answer": "No relevant documents found.", "sources": []}
+        return schemas.AnswerOut(query=q, answer="I could not find the exact exam date.", sources=[])
 
-    # results should look like: [{"text": ..., "doc_id": ..., "doc_title": ..., "score": ...}, ...]
-
-    # 🔹 Step 2: Apply reranker (if available in ai_utils)
+    # Step 2: re-rank (cross-encoder if available)
     reranked = ai_utils.rerank_candidates(q, results)
 
-    # 🔹 Step 3: Stream only the first valid answer
-    def answer_stream():
-        for chunk in reranked:
-            prompt = f"Answer the question based on the context.\nContext: {chunk['text']}\nQuestion: {q}"
-            try:
-                ans = ai_utils.qa_generator(prompt, max_new_tokens=120, do_sample=False)[0]['generated_text'].strip()
-                if ans and "I could not find" not in ans:
-                    payload = {
-                        "answer": ans,
-                        "doc_id": chunk["doc_id"],
-                        "doc_title": chunk["doc_title"]
-                    }
-                    yield json.dumps(payload) + "\n"
-                    return
-            except Exception as e:
-                print(f"⚠️ QA error: {e}")
+    # Step 3: synthesize a clean answer from top contexts
+    answer = ai_utils.synthesize_answer(q, reranked[:3]).strip()
 
-    return StreamingResponse(answer_stream(), media_type="application/json")
+    # Step 4: sources (top-2 shown)
+    srcs = [{"doc_id": r["doc_id"], "doc_title": r.get("doc_title", "Document")} for r in reranked[:2]]
 
-
-
-# Create tables on startup
-init_db()
+    return schemas.AnswerOut(query=q, answer=answer, sources=srcs)

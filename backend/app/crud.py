@@ -1,4 +1,5 @@
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func
 from . import models
 import numpy as np
 
@@ -23,7 +24,7 @@ def create_document(db: Session, title: str, content: str, summary: str, chunks:
         db_chunk = models.Chunk(
             doc_id=db_doc.id,
             text=chunk["text"],
-            embedding=chunk["embedding"]
+            embedding=chunk["embedding"]  # already normalized in ai_utils
         )
         db.add(db_chunk)
 
@@ -42,8 +43,10 @@ def cosine_similarity(a, b):
 def search_chunks(db: Session, query_embedding: list, top_k: int = 5):
     """
     Search the most similar chunks to a query embedding.
+    Uses in-memory cosine similarity for now (works fine for small/mid scale).
+    If scaling up, switch to pgvector extension in PostgreSQL for efficient ANN search.
     """
-    chunks = db.query(models.Chunk).all()
+    chunks = db.query(models.Chunk).options(joinedload(models.Chunk.document)).all()
     if not chunks:
         return []
 
